@@ -14,5 +14,6 @@ if [[ -n "$REBUILD" ]]; then
   docker pull postgres:13-alpine
   docker-compose build
 fi
+
 # mount directory as volume and skip downloading of images by setting a new entrypoint
 docker-compose -f docker-compose.yml -f docker-compose.override.yml run --rm --service-ports network_info "$@"

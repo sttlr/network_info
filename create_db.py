@@ -9,13 +9,22 @@ import logging
 
 import re
 import os.path
-from db.model import Block
+from db.model import Block, Organisation, ASN
 from db.helper import setup_connection
 from netaddr import iprange_to_cidrs
 
 VERSION = '2.0'
-FILELIST = ['afrinic.db.gz', 'apnic.db.inet6num.gz', 'apnic.db.inetnum.gz', 'arin.db.gz',
-            'lacnic.db.gz', 'ripe.db.inetnum.gz', 'ripe.db.inet6num.gz']
+FILELIST = [
+    'afrinic.db.gz',
+    'apnic.db.inetnum.gz', 'apnic.db.inet6num.gz',
+    'apnic.db.organisation.gz',
+    'apnic.db.aut-num.gz',
+    # 'arin.db.gz',  # it is a 'route' db
+    # 'lacnic.db.gz',  # it doesn't contain any tangible to org info
+    'ripe.db.inetnum.gz', 'ripe.db.inet6num.gz',
+    'ripe.db.organisation.gz',
+    'ripe.db.aut-num.gz'
+    ]
 NUM_WORKERS = cpu_count()
 LOG_FORMAT = '%(asctime)-15s - %(name)-9s - %(levelname)-8s - %(processName)-11s - %(filename)s - %(message)s'
 COMMIT_COUNT = 10000
@@ -56,7 +65,7 @@ def get_source(filename: str):
 
 
 def parse_property(block: str, name: str) -> str:
-    match = re.findall(b'^%s:\s?(.+)$' % (name), block, re.MULTILINE)
+    match = re.findall(rb'^%s:\s?(.+)$' % (name), block, re.MULTILINE)
     if match:
         # remove empty lines and remove multiple names
         x = b' '.join(list(filter(None, (x.strip().replace(
@@ -127,7 +136,13 @@ def read_blocks(filename: str) -> list:
                 continue
             # block end
             if line.strip() == b'':
-                if single_block.startswith(b'inetnum:') or single_block.startswith(b'inet6num:') or single_block.startswith(b'route:') or single_block.startswith(b'route6:'):
+                if (single_block.startswith(b'inetnum:')
+                    or single_block.startswith(b'inet6num:')
+                    or single_block.startswith(b'route:')
+                    or single_block.startswith(b'route6:')
+                    or single_block.startswith(b'aut-num:')
+                    or single_block.startswith(b'organisation:')
+                ):
                     # add source
                     single_block += b"cust_source: %s" % (cust_source)
                     blocks.append(single_block)
@@ -148,6 +163,58 @@ def read_blocks(filename: str) -> list:
     return blocks
 
 
+def add_inetnum(session, block: str) -> None:
+    inetnum = parse_property_inetnum(block)
+    if not inetnum:
+        # invalid entry, do not parse
+        logger.warning(f"Could not parse inetnum on block {block}. skipping")
+        return
+
+    netname = parse_property(block, b'netname')
+    # No netname field in ARIN block, try origin
+    if not netname:
+        netname = parse_property(block, b'origin')
+    description = parse_property(block, b'descr')
+    source = parse_property(block, b'cust_source')
+
+    if isinstance(inetnum, list):
+        for cidr in inetnum:
+            b = Block(inetnum=str(cidr), netname=netname, description=description, source=source)
+            session.add(b)
+    else:
+        b = Block(inetnum=inetnum.decode('utf-8'), netname=netname, source=source)
+        session.add(b)
+
+
+def add_asn(session, block: str) -> None:
+    autnum = parse_property(block, b'aut-num')
+    if not autnum:
+        # invalid entry, do not parse
+        logger.warning(f"Could not parse asn on block {block}. skipping")
+        return
+
+    asname = parse_property(block, b'as-name')
+    description = parse_property(block, b'descr')
+    source = parse_property(block, b'cust_source')
+
+    b = ASN(autnum=autnum, asname=asname, description=description, source=source)
+    session.add(b)
+
+
+def add_organisation(session, block: str) -> None:
+    organisation = parse_property(block, b'organisation')
+    if not organisation:
+        # invalid entry, do not parse
+        logger.warning(f"Could not parse organisation on block {block}. skipping")
+        return
+
+    orgname = parse_property(block, b'org-name')
+    source = parse_property(block, b'cust_source')
+
+    b = Organisation(organisation=organisation, orgname=orgname, source=source)
+    session.add(b)
+
+
 def parse_blocks(jobs: Queue, connection_string: str):
     session = setup_connection(connection_string)
 
@@ -160,59 +227,16 @@ def parse_blocks(jobs: Queue, connection_string: str):
         if block is None:
             break
 
-        inetnum = parse_property_inetnum(block)
-        if not inetnum:
-            # invalid entry, do not parse
-            logger.warning(f"Could not parse inetnum on block {block}. skipping")
-            continue
-        netname = parse_property(block, b'netname')
-        # No netname field in ARIN block, try origin
-        if not netname:
-            netname = parse_property(block, b'origin')
-        description = parse_property(block, b'descr')
-        country = parse_property(block, b'country')
-        # if we have a city object, append it to the country
-        city = parse_property(block, b'city')
-        if city:
-            country = f"{country} - {city}"
-        maintained_by = parse_property(block, b'mnt-by')
-        created = parse_property(block, b'created')
-        last_modified = parse_property(block, b'last-modified')
-        if not last_modified:
-            changed = parse_property(block, b'changed')
-            # ***@ripe.net 19960624
-            # a.c@domain.com 20060331
-            # maybe repeated multiple times, we only take the first
-            if re.match(r'^.+?@.+? \d+', changed):
-                date = changed.split(" ")[1].strip()
-                if len(date) == 8:
-                    year = int(date[0:4])
-                    month = int(date[4:6])
-                    day = int(date[6:8])
-                    # some sanity checks for dates
-                    if month >= 1 and month <=12 and day >= 1 and day <= 31:
-                        last_modified = f"{year}-{month}-{day}"
-                    else:
-                        logger.debug(f"ignoring invalid changed date {date}")
-                else:
-                    logger.debug(f"ignoring invalid changed date {date}")
-            elif "@" in changed:
-                # email in changed field without date
-                logger.debug(f"ignoring invalid changed date {changed}")
-            else:
-                last_modified = changed
-        status = parse_property(block, b'status')
-        source = parse_property(block, b'cust_source')
-
-        if isinstance(inetnum, list):
-            for cidr in inetnum:
-                b = Block(inetnum=str(cidr), netname=netname, description=description, country=country,
-                          maintained_by=maintained_by, created=created, last_modified=last_modified, source=source, status=status)
-                session.add(b)
-        else:
-            b = Block(inetnum=inetnum.decode('utf-8'), netname=netname, description=description, country=country,
-                      maintained_by=maintained_by, created=created, last_modified=last_modified, source=source, status=status)
-            session.add(b)
+        if (block.startswith(b'inetnum:')
+            or block.startswith(b'inet6num:')
+            or block.startswith(b'route:')
+            or block.startswith(b'route6:')
+            ):
+            add_inetnum(session, block)
+        elif block.startswith(b'aut-num:'):
+            add_asn(session, block)
+        elif block.startswith(b'organisation:'):
+            add_organisation(session, block)
 
         counter += 1
         BLOCKS_DONE += 1
