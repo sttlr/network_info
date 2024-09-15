@@ -10,4 +10,4 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 
 cd $DIR/../
 
-docker-compose run --rm -e PGPASSWORD=network_info --entrypoint=psql db -h db -U network_info -t -q -P pager=off -c "SELECT asn.autnum FROM asn WHERE asn.asname ILIKE '%$1%' or asn.description ILIKE '%$1%';" network_info | grep -v '\[+\] Building' | sed 's/^ //'
+docker compose run --rm -e PGPASSWORD=network_info --entrypoint=psql db -h db -U network_info -t -q -P pager=off -c "SELECT asn.autnum FROM asn WHERE asn.asname ILIKE '%$1%' or asn.description ILIKE '%$1%';" network_info | grep -v '\[+\] Building' | sed 's/^ //'
